@@ -406,6 +406,8 @@ function createPhone(root, store, code, opts = {}) {
         ${d.challenge ? `<div class="ph-clue" style="font-size:1.05em">${esc(d.challenge)}</div>` : `<div class="sub" style="color:#fff">Drawing a challenge from the hat…</div>`}
         ${d.winner ? `<div class="msg" style="color:var(--gold)">${esc(nameOf(d.winner))} wins${d.amt ? ' and steals ' + money(d.amt) : ''}!</div>` : mine ? `<div class="sub" style="color:#fff">You're in this one. Good luck!</div>` : ''}` };
     }
+    if (ph === 'wcard' && pub.wcard) { const mine = pub.wcard.pid === pid;
+      return { top, cls: 'dd', body: `<div class="msg" style="font-size:1.5em">🎡 WHEEL CARD!</div><div class="msg">${mine ? 'Take the ' + money(pub.wcard.val) + ' or spin?' : esc(nameOf(pub.wcard.pid)) + ' is deciding: take ' + money(pub.wcard.val) + ' or spin…'}</div>${mine ? '<div class="sub" style="color:#fff">Tell the host!</div>' : ''}` }; }
     if (ph === 'wheel' && pub.wheel) {
       const w = pub.wheel, mine = w.pid === pid;
       if (w.state === 'ready') return { top, body: mine ? `<div class="msg">Your spin!</div><button class="buzz" data-p="spin" style="background:var(--gold);color:var(--ink);box-shadow:0 10px 0 #b38a00">SPIN</button>` : `<div class="msg">${esc(nameOf(w.pid))} is about to spin the wheel 🎡</div>` };
@@ -487,8 +489,8 @@ const SAVE_KEY = 'fj-game-v1';
 const ROUND_DEFS = [{ name: 'Jeopardy!', base: 200 }, { name: 'Double Jeopardy!', base: 400 }];
 
 const DEFAULT_DUELS = ['Toilet paper unroll race: first to empty the roll wins', 'Flip cup (drink of choice)', 'Rock, paper, scissors: best of 3', 'Beer pong: first to sink 3 (drink of choice)'];
-const DEFAULT_WHEEL = ['+$500', 'Take a shot (or a sip of anything)', '−$500', 'Truth or dare (passing is allowed)', '+$1,000', 'Bankrupt', 'Mystery drink', 'Friendship points: split your score with someone'];
-function cfg() { const s = G.settings; if (s.rounds == null) s.rounds = 1; if (!s.duels) s.duels = DEFAULT_DUELS.slice(); if (!s.wheel) s.wheel = DEFAULT_WHEEL.slice(); if (s.maxDuels == null) s.maxDuels = 3; if (G.duelsUsed == null) G.duelsUsed = 0; return s; }
+const DEFAULT_WHEEL = ['+$500', 'Take a shot (any drink) = +$1,500 if done', '-$500', 'Charades Sprint = split $1,000 with guesser', '30-Second Toast = +$1,000 if done', 'Bankrupt', '- $200', 'Mind Meld Splitsies = split $1,000', 'Charades Sprint = split $1,000 with guesser', '+ $200', 'Take a shot! (any drink) = +$1,500 if done', 'Mind Meld 2X Splitsies = split $2,000'];
+function cfg() { const s = G.settings; if (s.rounds == null) s.rounds = 1; if (!s.duels) s.duels = DEFAULT_DUELS.slice(); if (!s.wheel4) { s.wheel4 = true; s.wheel = DEFAULT_WHEEL.slice(); } if (s.wheelCards == null) s.wheelCards = 2; if (s.maxDuels == null) s.maxDuels = 3; if (G.duelsUsed == null) G.duelsUsed = 0; return s; }
 function newCode() { const L = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; let s = ''; for (let i = 0; i < 4; i++) s += L[Math.floor(Math.random() * L.length)]; return s; }
 function blankGame() {
   return { v: 1, code: newCode(), title: 'Friendsgiving Jeopardy!', phase: 'setup', roundIdx: 0, players: [], rounds: [], final: null,
@@ -508,16 +510,63 @@ function loadCSV(text) {
   let nameCol = headers.findIndex(h => /name/i.test(h));
   if (nameCol < 0) nameCol = headers.findIndex(h => !/timestamp|email/i.test(h));
   const skip = i => i === nameCol || /^timestamp$|email address|^email$|score/i.test(headers[i]);
-  const qcols = headers.map((h, i) => i).filter(i => !skip(i));
+  const body = rows.slice(1);
+  const all = headers.map((h, i) => i).filter(i => !skip(i));
+  const groups = detectPolls(headers, body, all);
+  const pollSet = new Set(groups.flatMap(g => g.cols));
+  const qcols = all.filter(i => !pollSet.has(i));
   const assign = {};
-  const n = qcols.length;
-  const r1n = Math.min(6, Math.ceil(n / 2));
+  groups.forEach(g => assign[g.id] = 'r1');
+  const r1n = Math.max(0, 6 - groups.length);
   qcols.forEach((i, k) => { assign[i] = k < r1n ? 'r1' : (k < r1n + 6 ? 'r2' : 'skip'); });
-  const titles = {}; qcols.forEach(i => titles[i] = shortTitle(headers[i]));
-  G.setup = { headers, rows: rows.slice(1), nameCol, qcols, assign, titles };
+  const titles = {}; qcols.forEach(i => titles[i] = shortTitle(headers[i])); groups.forEach(g => titles[g.id] = g.title);
+  G.setup = { headers, rows: body, nameCol, qcols, assign, titles, groups };
   render();
 }
 
+/* ---- "odd one out" questions (Hot Takes, Have You Ever, any multiple choice) ---- */
+const POLL_VALS = ['red flag', 'green flag', 'yes', 'no', 'prefer not to say'];
+const normV = v => String(v || '').trim().toLowerCase().replace(/[^\w\s']/g, '').replace(/\s+/g, ' ').trim();
+function gridParts(h) { const m = String(h).match(/^(.*?)\s*\[(.+)\]\s*$/); return m ? { title: m[1].trim(), row: m[2].trim() } : null; }
+function detectPolls(headers, body, cols) {
+  const byKey = new Map();
+  for (const i of cols) {
+    const vals = new Set(body.map(r => normV(r[i])).filter(Boolean));
+    const g = gridParts(headers[i]);
+    const known = vals.size > 0 && [...vals].every(v => POLL_VALS.includes(v));
+    if (!g && !(known && vals.size <= 3)) continue;
+    const kind = known && [...vals].every(v => ['red flag', 'green flag', 'prefer not to say'].includes(v)) ? 'flag'
+      : known && [...vals].every(v => ['yes', 'no', 'prefer not to say'].includes(v)) ? 'yn' : 'mc';
+    const key = g ? 'grid:' + g.title.toLowerCase() : 'kind:' + kind;
+    if (!byKey.has(key)) {
+      const t = g ? g.title.split(/[:?(]/)[0].trim().toUpperCase() : kind === 'flag' ? 'HOT TAKES' : kind === 'yn' ? 'HAVE YOU EVER…' : 'ODD ONE OUT';
+      byKey.set(key, { id: 'g' + byKey.size, title: t || 'ODD ONE OUT', kind, cols: [] });
+    }
+    byKey.get(key).cols.push(i);
+  }
+  return [...byKey.values()];
+}
+function pollScenario(header) { const g = gridParts(header); let t = g ? g.row : header; return t.replace(/^\s*(have you ever|ever)\s+/i, '').trim(); }
+function pollClue(group, ci, players) {
+  const ans = []; for (const p of players) { const raw = p.row && p.row[ci]; const v = normV(raw); if (v && v !== 'prefer not to say') ans.push({ p, v, raw: String(raw).trim() }); }
+  if (ans.length < 3) return null;
+  const counts = {}; ans.forEach(a => counts[a.v] = (counts[a.v] || 0) + 1);
+  if (Object.keys(counts).length < 2) return null;
+  const lone = Object.keys(counts).filter(v => counts[v] === 1); if (!lone.length) return null;
+  const v = lone[Math.floor(Math.random() * lone.length)]; const who = ans.find(a => a.v === v);
+  let sc = pollScenario(S_headers[ci]).replace(/[.?!]+$/, '');
+  const low = sc.charAt(0).toLowerCase() + sc.slice(1);
+  let text;
+  if (group.kind === 'flag') text = `Only one of us thinks this is a ${v === 'green flag' ? 'GREEN' : 'RED'} flag: ${sc}`;
+  else if (group.kind === 'yn') text = v === 'yes' ? `Only one of us HAS ${low}.` : `Only one of us has NEVER ${low}.`;
+  else text = `Only one of us answered "${who.raw}": ${sc}`;
+  const note = group.kind === 'flag' ? `The room: ${counts['red flag'] || 0} 🚩 · ${counts['green flag'] || 0} 💚`
+    : group.kind === 'yn' ? `The room: ${counts['yes'] || 0} yes · ${counts['no'] || 0} no`
+    : 'The room: ' + Object.entries(counts).map(([k, n]) => `${n} ${k}`).join(' · ');
+  return { text, sid: who.p.id, note };
+}
+let S_headers = [];
+function pollUsable(group, people) { S_headers = G.setup.headers; return group.cols.filter(ci => pollClue(group, ci, people.map((p, k) => ({ id: 'x' + k, row: p.row })))).length; }
 function setupPeople() {
   const s = G.setup; const byName = new Map();
   for (const r of s.rows) { const nm = (r[s.nameCol] || '').trim(); if (nm) byName.set(nm.toLowerCase(), { name: nm, row: r }); } // latest submission wins
@@ -533,14 +582,24 @@ function buildBoard() {
   const usage = {}; G.players.forEach(p => usage[p.id] = 0);
   const per = Math.max(1, Math.min(5, G.settings.perCat));
   G.rounds = ROUND_DEFS.map((def, ri) => {
-    const cols = s.qcols.filter(i => s.assign[i] === (ri === 0 ? 'r1' : 'r2'));
+    const want = ri === 0 ? 'r1' : 'r2';
+    const cols = s.qcols.filter(i => s.assign[i] === want);
+    S_headers = s.headers;
+    const pcats = (s.groups || []).filter(g => s.assign[g.id] === want).map(g => {
+      const cands = shuffle(g.cols).map(ci => pollClue(g, ci, G.players)).filter(Boolean);
+      const pick = []; const seen = {};
+      for (const pass of [0, 1, 2, 3]) for (const c of cands) { if (pick.length >= per) break; if (!pick.includes(c) && (seen[c.sid] || 0) <= pass) { pick.push(c); seen[c.sid] = (seen[c.sid] || 0) + 1; } }
+      pick.forEach(c => usage[c.sid] = (usage[c.sid] || 0) + 1);
+      return { title: s.titles[g.id] || g.title, q: g.title, poll: true,
+        clues: pick.map((c, k) => ({ val: def.base * (k + 1), text: c.text, sid: c.sid, note: c.note, used: false, dd: false })) };
+    }).filter(c => c.clues.length);
     const cats = cols.map(ci => {
       const cands = G.players.filter(p => p.row && (p.row[ci] || '').trim());
       const pick = shuffle(cands).sort((a, b) => usage[a.id] - usage[b.id]).slice(0, per);
       pick.forEach(p => usage[p.id]++);
       return { title: s.titles[ci] || shortTitle(s.headers[ci]), q: s.headers[ci],
         clues: shuffle(pick).map((p, k) => ({ val: def.base * (k + 1), text: p.row[ci].trim(), sid: p.id, used: false, dd: false })) };
-    });
+    }).concat(pcats);
     return { name: def.name, base: def.base, cats };
   }).filter(r => r.cats.length);
   // daily doubles: 1 in first round, 2 in second (never top row)
@@ -548,6 +607,13 @@ function buildBoard() {
     const spots = []; r.cats.forEach((c, ci) => c.clues.forEach((cl, k) => { if (k > 0) spots.push([ci, k]); }));
     const want = ri === 0 ? (cfg().rounds === 1 ? 2 : 1) : 2; const usedCats = new Set();
     for (const [ci, k] of shuffle(spots)) { if (usedCats.has(ci)) continue; r.cats[ci].clues[k].dd = true; usedCats.add(ci); if (usedCats.size >= want) break; }
+  });
+  const nW = cfg().wheelCards;
+  if (nW) G.rounds.forEach(r => {
+    const ddCats = new Set(); r.cats.forEach((c, ci) => { if (c.clues.some(x => x.dd)) ddCats.add(ci); });
+    const spots = []; r.cats.forEach((c, ci) => c.clues.forEach((cl, k) => { if (!cl.dd) spots.push([ci, k]); }));
+    const used = new Set(); let placed = 0;
+    for (const pass of [0, 1]) for (const [ci, k] of shuffle(spots)) { if (placed >= nW) break; if (used.has(ci) || (pass === 0 && ddCats.has(ci)) || r.cats[ci].clues[k].wheel) continue; r.cats[ci].clues[k].wheel = true; used.add(ci); placed++; }
   });
   const fcol = s.qcols.find(i => s.assign[i] === 'final');
   if (fcol != null) {
@@ -573,9 +639,10 @@ function pubState() {
     ? { mode: fmode(), cat: G.final.cat, text: G.phase !== 'finalCat' && G.settings.showClueOnPhone ? G.final.text : null } : null;
   const d = G.phase === 'duel' && G.current && G.current.duel;
   const duel = d ? { a: d.a, b: d.b, challenge: d.challenge, winner: d.winner, amt: d.amt } : null;
+  const wcard = G.phase === 'wcard' && G.current && G.current.wc ? { pid: G.current.wc.pid, val: round().cats[G.current.c].clues[G.current.i].val } : null;
   const w = G.phase === 'wheel' && G.wheel;
-  const wheel = w ? { pid: w.pid, token: w.token, state: w.state, label: w.state === 'done' ? cfg().wheel[w.idx] : null } : null;
-  return { phase: G.phase, round: round() ? round().name : null, players, clue: G.phase === 'duel' ? null : clue, control: G.control, final: fin, duel, wheel, t: Date.now() };
+  const wheel = w ? { pid: w.pid, token: w.token, state: w.state, label: w.state === 'done' ? wheelLabel(cfg().wheel[w.idx]) : null } : null;
+  return { phase: G.phase, round: round() ? round().name : null, players, clue: G.phase === 'duel' || G.phase === 'wcard' ? null : clue, control: G.control, final: fin, duel, wheel, wcard, t: Date.now() };
 }
 function publish() { if (store) store.set(`games/${G.code}/pub`, pubState()); }
 function commit() { save(); publish(); render(); }
@@ -601,7 +668,8 @@ function excludedFor(cl) { const ex = {}; if (G.settings.lockSubject && cl.sid) 
 function chooseClue(ci, i) {
   const cl = round().cats[ci].clues[i]; if (cl.used) return;
   G.current = { c: ci, i, token: 't' + uid(), open: false, buzzed: null, excluded: excludedFor(cl), revealed: false, dd: null };
-  if (cl.dd) { const def = G.control || (G.players[0] && G.players[0].id); G.current.dd = { pid: def, wager: '' }; G.phase = 'dd'; sfx.dd(); }
+  if (cl.wheel) { const def = G.control || (G.players[0] && G.players[0].id); G.current.wc = { pid: def }; G.phase = 'wcard'; sfx.dd(); }
+  else if (cl.dd) { const def = G.control || (G.players[0] && G.players[0].id); G.current.dd = { pid: def, wager: '' }; G.phase = 'dd'; sfx.dd(); }
   else G.phase = 'clue';
   commit();
 }
@@ -647,11 +715,15 @@ function duelWinner(id) {
   G.duelsUsed = (G.duelsUsed || 0) + 1; (G.duelHistory = G.duelHistory || []).push(d.challenge);
   round().cats[c.c].clues[c.i].used = true; sfx.right(); commit();
 }
-function wheelParse(label) {
-  const t = String(label).trim(); let m;
+function wheelLabel(line) { return String(line).split(' = ')[0].trim(); }
+function wheelParse(line) {
+  const parts = String(line).split(' = '); const label = parts[0].trim(); const t = (parts.length > 1 ? parts.slice(1).join(' = ') : label).trim(); let m;
+  if ((m = t.match(/^split\s*\$?\s*([\d,]+)/i))) return { kind: 'split', n: +m[1].replace(/,/g, ''), guess: /guess/i.test(t) };
+  if ((m = t.match(/^[+＋]?\s*\$\s*([\d,]+)\s*if\s+done/i)) || (m = t.match(/^[+＋]\s*\$?\s*([\d,]+)\s*if\s+done/i))) return { kind: 'done', n: +m[1].replace(/,/g, '') };
   if ((m = t.match(/^[+＋]\s*\$?\s*([\d,]+)/))) return { kind: 'add', n: +m[1].replace(/,/g, '') };
   if ((m = t.match(/^[-−–]\s*\$?\s*([\d,]+)/))) return { kind: 'add', n: -m[1].replace(/,/g, '') };
   if (/bankrupt/i.test(t)) return { kind: 'bankrupt' };
+  if (/^\s*(2x|2×|double)\b.*(money|score|points)/i.test(t)) return { kind: 'double' };
   return null;
 }
 function openWheel(pid, fromClue) {
@@ -669,15 +741,28 @@ function spinWheel() {
   const base = w.rot || 0;
   w.idx = idx; w.target = base - (((base % 360) + 360) % 360) + 360 * 6 + (360 - center) + jitter; w.state = 'spinning'; commit();
 }
-function wheelApply() {
+function wheelApply(ok) {
   const w = G.wheel; if (!w || w.state !== 'done' || w.applied) return;
   const e = wheelParse(cfg().wheel[w.idx]); const p = player(w.pid); if (!e || !p) return;
-  snap('Wheel'); if (e.kind === 'add') p.score += e.n; else if (p.score > 0) p.score = 0;
-  w.applied = true; e.kind === 'add' && e.n > 0 ? sfx.right() : sfx.wrong(); commit();
+  if (e.kind === 'split' && ok && !w.partner) { toast(e.guess ? 'Pick who guessed it first.' : 'Pick a partner first.'); return; }
+  snap('Wheel');
+  if (e.kind === 'add') p.score += e.n;
+  else if (e.kind === 'double') { if (p.score > 0) p.score *= 2; }
+  else if (e.kind === 'bankrupt') { if (p.score > 0) p.score = 0; }
+  else if (e.kind === 'done') { if (ok) p.score += e.n; }
+  else if (e.kind === 'split') { if (ok) { const h = Math.round(e.n / 2); p.score += h; player(w.partner).score += h; } }
+  w.applied = ok === false ? 'no' : true;
+  const good = (e.kind === 'add' && e.n > 0) || e.kind === 'double' || ((e.kind === 'done' || e.kind === 'split') && ok);
+  good ? sfx.right() : sfx.wrong(); commit();
+}
+function takeCardMoney() {
+  const c = G.current; if (!c || !c.wc) return; const cl = round().cats[c.c].clues[c.i]; const p = player(c.wc.pid); if (!p) return;
+  snap('Took the money'); p.score += cl.val; cl.used = true; G.control = p.id; G.current = null; sfx.right();
+  const left = round().cats.some(cat => cat.clues.some(x => !x.used)); G.phase = left ? 'board' : 'roundEnd'; commit();
 }
 function wheelDone() {
   const prev = (G.wheel && G.wheel.prev) || 'board'; G.wheel = null; store.set(`games/${G.code}/spin`, null);
-  if (prev === 'board' || prev === 'dd' || prev === 'clue' || prev === 'duel') { const left = round().cats.some(cat => cat.clues.some(cl => !cl.used)); G.phase = left ? 'board' : 'roundEnd'; }
+  if (['board', 'dd', 'clue', 'duel', 'wcard'].includes(prev)) { const left = round().cats.some(cat => cat.clues.some(cl => !cl.used)); G.phase = left ? 'board' : 'roundEnd'; }
   else G.phase = prev;
   commit();
 }
@@ -744,7 +829,6 @@ function topbar() {
   return `<div class="topbar"><div class="brand">${esc(G.title)}</div>
     ${inGame ? `<span class="room">Room ${esc(G.code)}</span>` : ''}
     ${inGame ? `<button class="small ${rehearsing ? 'pink' : 'ghost'}" data-a="rehearse">📱 Test phones</button>` : ''}
-    ${['board', 'roundEnd'].includes(G.phase) ? `<button class="small ghost" data-a="wheelopen" title="Spin the wheel">🎡</button>` : ''}
     ${inGame && undoStack.length ? `<button class="small gold" data-a="undo" title="Undo: ${esc(undoStack[undoStack.length - 1].label)}">↶ Undo</button>` : ''}
     <button class="small ghost" data-a="mute" title="Sound">${muted ? '🔇' : '🔊'}</button>
     ${inGame ? `<button class="small ghost" data-a="fs" title="Full screen">⛶</button><button class="small ghost" data-a="menu">☰</button>` : ''}</div>`;
@@ -765,7 +849,7 @@ function viewSetup() {
     if (saved) html += `<div class="card"><b>There's a saved game on this device.</b><p class="muted">Keep using it, or start fresh.</p><div class="row"><button class="gold" data-a="resume">Resume saved game</button></div></div>`;
   } else {
     const people = setupPeople();
-    const count = k => s.qcols.filter(i => s.assign[i] === k).length;
+    const count = k => s.qcols.filter(i => s.assign[i] === k).length + (s.groups || []).filter(g => s.assign[g.id] === k).length;
     html += `<div class="card"><h2>Choose your categories</h2>
       <p class="muted">${people.length} friends answered ${s.qcols.length} questions. Give each category a short, punchy title and pick which round it goes in. A full round has 6 categories.</p>
       <div class="row" style="margin-bottom:.6rem"><span class="pill">Round 1: ${count('r1')}</span><span class="pill">Round 2: ${count('r2')}</span><span class="pill">Final: ${count('final')}</span>
@@ -777,6 +861,8 @@ function viewSetup() {
       <table class="qtable"><tr><th>Category title</th><th style="width:140px">Round</th><th style="width:70px">Answers</th></tr>
       ${s.qcols.map(i => { const answered = s.rows.filter(r => (r[i] || '').trim()).length; return `<tr><td><input data-f="ctitle" data-i="${i}" value="${esc(s.titles[i])}"><div class="q">${esc(s.headers[i])}</div></td>
         <td><select data-f="assign" data-i="${i}">${[['r1', 'Round 1'], ['r2', 'Round 2'], ['final', 'Final'], ['skip', 'Skip']].map(([v, l]) => `<option value="${v}" ${s.assign[i] === v ? 'selected' : ''}>${l}</option>`).join('')}</select></td><td>${answered}</td></tr>`; }).join('')}
+      ${(s.groups || []).map(g => { const usable = pollUsable(g, people); return `<tr style="background:#f6f3ff"><td><input data-f="gtitle" data-g="${g.id}" value="${esc(s.titles[g.id])}"><div class="q"><span class="pill">Odd one out</span> ${g.cols.length} questions · <b>${usable} usable clue${usable === 1 ? '' : 's'}</b> (exactly one person answered differently)</div></td>
+        <td><select data-f="gassign" data-g="${g.id}">${[['r1', 'Round 1'], ['r2', 'Round 2'], ['skip', 'Skip']].map(([v, l]) => `<option value="${v}" ${s.assign[g.id] === v ? 'selected' : ''}>${l}</option>`).join('')}</select></td><td>${usable}</td></tr>`; }).join('')}
       </table>
       <h3>Options</h3>
       <div class="row"><label class="row" style="gap:.3rem">Rounds <select data-f="rounds" style="width:auto"><option value="1" ${cfg().rounds === 1 ? 'selected' : ''}>1: Jeopardy! + Final</option><option value="2" ${cfg().rounds === 2 ? 'selected' : ''}>2: adds Double Jeopardy!</option></select></label>
@@ -792,14 +878,14 @@ function viewSetup() {
 function viewReview() {
   const opts = (sel) => G.players.map(p => `<option value="${p.id}" ${p.id === sel ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
   let html = `<div class="panel" style="max-width:1300px"><div class="card"><h2>Review the board</h2>
-    <p class="muted">Edit any clue to make it funnier or less of a giveaway. Each clue's correct response is the friend shown under it. Pink outlines are Daily Doubles. Click the ★ to move one.</p>
+    <p class="muted">Edit any clue to make it funnier or less of a giveaway. Each clue's correct response is the friend shown under it. Pink outlines are Daily Doubles (★), gold outlines are Wheel cards (🎡). Click either icon to move them.</p>
     <div class="row"><button class="ghost" data-a="tosetup" style="color:var(--ink);box-shadow:inset 0 0 0 2px #c9cdf0">← Categories</button><button class="gold" data-a="build">🔀 Reshuffle clues</button><button class="pink" data-a="tolobby">Looks good → Lobby</button></div></div>`;
   G.rounds.forEach((r, ri) => {
     html += `<div class="card review-round"><h2>${esc(r.name)}</h2><div class="review-grid" style="grid-template-columns:repeat(${r.cats.length},minmax(150px,1fr))">`;
     r.cats.forEach((c, ci) => {
       html += `<div class="review-cat"><input class="title" data-f="rtitle" data-r="${ri}" data-c="${ci}" value="${esc(c.title)}">`;
       c.clues.forEach((cl, k) => {
-        html += `<div class="review-clue ${cl.dd ? 'dd' : ''}"><div class="meta"><span>${money(cl.val)}</span><button class="small" title="Daily Double" data-a="toggledd" data-r="${ri}" data-c="${ci}" data-k="${k}" style="background:${cl.dd ? 'var(--pink)' : '#eee'};color:${cl.dd ? '#fff' : '#999'}">★</button></div>
+        html += `<div class="review-clue ${cl.dd ? 'dd' : ''}" style="${cl.wheel ? 'border-color:var(--gold)' : ''}"><div class="meta"><span>${money(cl.val)}</span><button class="small" title="Daily Double" data-a="toggledd" data-r="${ri}" data-c="${ci}" data-k="${k}" style="background:${cl.dd ? 'var(--pink)' : '#eee'};color:${cl.dd ? '#fff' : '#999'}">★</button><button class="small" title="Wheel card" data-a="togglewc" data-r="${ri}" data-c="${ci}" data-k="${k}" style="background:${cl.wheel ? 'var(--gold)' : '#eee'};color:${cl.wheel ? '#0b0e24' : '#999'}">🎡</button></div>
           <textarea data-f="rtext" data-r="${ri}" data-c="${ci}" data-k="${k}">${esc(cl.text)}</textarea>
           <select data-f="rsid" data-r="${ri}" data-c="${ci}" data-k="${k}">${opts(cl.sid)}</select></div>`;
       });
@@ -809,13 +895,14 @@ function viewReview() {
   });
   const S = cfg();
   html += `<div class="card"><h2>Party extras</h2>
-    <p class="muted">When someone finds a Daily Double, they choose: answer the clue, <b>duel</b> another player, or <b>spin the wheel</b>. You can also spin the wheel anytime from the 🎡 button.</p>
-    <div class="row"><label class="row" style="gap:.3rem"><b>Duels per game</b> <select data-f="maxduels" style="width:auto">${[0, 1, 2, 3, 4, 5].map(n => `<option ${S.maxDuels === n ? 'selected' : ''}>${n}</option>`).join('')}</select></label></div>
+    <p class="muted">When someone finds a <b>Daily Double</b>, they choose: answer the clue or <b>duel</b> another player. A hidden <b>Wheel card</b> lets them take the card's money or gamble on a spin.</p>
+    <div class="row"><label class="row" style="gap:.3rem"><b>Duels per game</b> <select data-f="maxduels" style="width:auto">${[0, 1, 2, 3, 4, 5].map(n => `<option ${S.maxDuels === n ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+      <label class="row" style="gap:.3rem"><b>Wheel cards per round</b> <select data-f="wheelcards" style="width:auto">${[0, 1, 2, 3].map(n => `<option ${S.wheelCards === n ? 'selected' : ''}>${n}</option>`).join('')}</select></label> <span class="muted" style="font-size:.85rem">(applies when you reshuffle)</span></div>
     <div class="row" style="align-items:flex-start;margin-top:.6rem">
       <div style="flex:1;min-width:260px"><b>Duel challenges</b> <span class="muted">(one per line, drawn from the hat)</span><textarea data-f="duels" rows="6">${esc(S.duels.join('\n'))}</textarea>
         <p class="muted" style="font-size:.85rem">Winner steals the loser's points, up to their own score or the round's top value ($1,000), whichever is higher.</p></div>
-      <div style="flex:1;min-width:260px"><b>Wheel slices</b> <span class="muted">(one per line, 4 to 12)</span><textarea data-f="wheel" rows="6">${esc(S.wheel.join('\n'))}</textarea>
-        <p class="muted" style="font-size:.85rem">Slices starting with <b>+$</b> or <b>−$</b>, and <b>Bankrupt</b>, can be applied with one tap. Everything else is just announced.</p></div></div></div>`;
+      <div style="flex:1;min-width:260px"><b>Wheel slices</b> <span class="muted">(one per line, 4 to 12; "Name = what it pays")</span><textarea data-f="wheel" rows="6">${esc(S.wheel.join('\n'))}</textarea>
+        <p class="muted" style="font-size:.85rem">Pays: <b>+$500</b>, <b>-$500</b>, <b>Bankrupt</b>, <b>2X your money</b>, <b>= +$1,500 if done</b> (pays only if they do it), <b>= split $1,000</b> (spinner + a partner split it on a Mind Meld match), <b>= split $1,000 with guesser</b> (actor + first correct guesser split it). Anything else is just announced.</p></div></div></div>`;
   if (G.final && fmode() === 'write') {
     html += `<div class="card"><h2>Final Jeopardy</h2>
       <p class="muted">Write your own Final. Everyone wagers, then types an answer on their phone. During the reveal you mark each answer right or wrong on the TV.</p>
@@ -886,7 +973,7 @@ function viewClue() {
     ctrls = `<button class="gold eq" data-a="reveal">Skip, reveal answer <span class="kbd">R</span></button><button class="pink eq" data-a="open">Open buzzers <span class="kbd">Space</span></button>`;
   }
   return `<div class="cluescreen"><div class="cluehead"><span>${esc(cat.title)}</span><span class="v">${money(val)}</span></div>${banner}
-    <div class="cluetext ${cl.text.length > 90 ? 'small' : ''}">${c.revealed || c.shown ? `<div><div style="margin-bottom:1rem">${esc(cl.text)}</div><div class="answer">Who is ${esc(nameOf(cl.sid))}?</div></div>` : esc(cl.text)}</div>
+    <div class="cluetext ${cl.text.length > 90 ? 'small' : ''}">${c.revealed || c.shown ? `<div><div style="margin-bottom:1rem">${esc(cl.text)}</div><div class="answer">Who is ${esc(nameOf(cl.sid))}?</div>${cl.note ? `<div style="font-family:var(--ui);font-weight:800;font-size:clamp(1rem,2.4vw,1.7rem);margin-top:.6rem;text-transform:none;color:var(--lav)">${esc(cl.note)}</div>` : ''}</div>` : esc(cl.text)}</div>
     <div class="controls"><div class="status">${status}</div>${ctrls}</div></div>`;
 }
 
@@ -906,10 +993,19 @@ function viewDD() {
     <div><b>Who found it?</b><div class="pickrow" style="margin-top:.4rem">${G.players.map(q => `<button class="small ${q.id === c.dd.pid ? 'sel' : ''}" data-a="ddpick" data-id="${q.id}">${esc(q.name)}</button>`).join('')}</div></div>
     <div class="modepick"><button class="${kind === 'wager' ? 'sel' : ''}" data-a="ddkind" data-k="wager">Answer the clue</button>
       <button class="${kind === 'duel' ? 'sel' : ''}" data-a="ddkind" data-k="duel" ${left && G.players.some(q => q.id !== c.dd.pid && q.score > 0) ? '' : 'disabled'}>⚔️ Duel (${left} left)</button>
-      <button class="${kind === 'wheel' ? 'sel' : ''}" data-a="ddkind" data-k="wheel">🎡 Spin the wheel</button></div>
+</div>
     ${body}</div></div>`;
 }
 
+function viewWCard() {
+  const c = G.current, cl = round().cats[c.c].clues[c.i], p = player(c.wc.pid);
+  return `<div class="cluescreen" style="background:radial-gradient(circle at 50% 40%,#2c3fd6,var(--night))"><div class="center">
+    <div class="dd-splash" style="font-size:clamp(2.4rem,8vw,6rem)">🎡 WHEEL CARD!</div>
+    <div><b>Who picked it?</b><div class="pickrow" style="margin-top:.4rem">${G.players.map(q => `<button class="small ${q.id === c.wc.pid ? 'sel' : ''}" data-a="wcpick" data-id="${q.id}">${esc(q.name)}</button>`).join('')}</div></div>
+    <div class="vs" style="font-size:clamp(1.4rem,4vw,2.8rem)">${esc(p ? p.name : '')}: take the money or <span>spin?</span></div>
+    <div class="row" style="justify-content:center"><button class="mint" data-a="wctake" style="font-size:1.3rem">💵 Take the ${money(cl.val)}</button><button class="gold" data-a="wcspin" style="font-size:1.3rem">🎡 Spin the wheel</button></div>
+    <div class="stakes">The clue is retired either way.</div></div></div>`;
+}
 function viewDuel() {
   const d = G.current.duel, A = player(d.a), B = player(d.b);
   let mid, ctrl;
@@ -928,12 +1024,12 @@ function viewDuel() {
 const WHEEL_COLORS = ['#1f2fb5', '#ff3d8b', '#ffcf3f', '#ff6b4a', '#b9a6ff', '#3ee0a1'];
 function wheelSVG(items) {
   const n = items.length, seg = 360 / n, R = 240, rad = a => a * Math.PI / 180, pt = (r, a) => `${(r * Math.sin(rad(a))).toFixed(2)},${(-r * Math.cos(rad(a))).toFixed(2)}`;
-  const slices = items.map((t, i) => {
+  const slices = items.map((t0, i) => { const t = wheelLabel(t0);
     const a0 = i * seg, a1 = a0 + seg, col = WHEEL_COLORS[(n % WHEEL_COLORS.length === 1 && i === n - 1) ? 2 : i % WHEEL_COLORS.length];
     const dark = ['#ffcf3f', '#b9a6ff', '#3ee0a1'].includes(col);
-    const label = t.length > 20 ? t.slice(0, 19) + '…' : t;
+    const lim = n > 9 ? 24 : 20; const label = t.length > lim ? t.slice(0, lim - 1) + '…' : t;
     return `<path d="M0,0 L${pt(R, a0)} A${R},${R} 0 ${seg > 180 ? 1 : 0} 1 ${pt(R, a1)} Z" fill="${col}" stroke="#0b0e24" stroke-width="4"/>
-      <g transform="rotate(${a0 + seg / 2 - 90})"><text x="58" y="7" font-family="Inter,system-ui,sans-serif" font-weight="800" font-size="${n > 9 ? 15 : 18}" fill="${dark ? '#0b0e24' : '#fff'}">${esc(label)}</text></g>`;
+      <g transform="rotate(${a0 + seg / 2 - 90})"><text x="58" y="7" font-family="Inter,system-ui,sans-serif" font-weight="800" font-size="${n > 9 ? 14 : 18}" fill="${dark ? '#0b0e24' : '#fff'}">${esc(label)}</text></g>`;
   }).join('');
   return `<svg viewBox="-250 -250 500 500"><g id="wheelg" style="transform-origin:0 0">${slices}</g><circle r="34" fill="#0b0e24" stroke="#ffcf3f" stroke-width="6"/><text y="9" text-anchor="middle" font-size="26">🦃</text></svg>`;
 }
@@ -944,10 +1040,18 @@ function viewWheel() {
     <div class="stakes">${p ? esc(p.name) + ' can tap SPIN on their phone' : ''}</div>
     <div class="row" style="justify-content:center"><button class="gold" data-a="wspin" style="font-size:1.15rem">Spin from here <span class="kbd">Space</span></button><button class="ghost small" data-a="wdone">Cancel</button></div>`;
   else if (w.state === 'spinning') side = `<div class="stakes" style="font-size:1.2rem">${esc(p ? p.name : '')} is spinning…</div>`;
-  else { const label = items[w.idx] || '', e = wheelParse(label);
-    side = `<div class="wheelres">${esc(label)}</div>
-    <div class="row" style="justify-content:center">${e && !w.applied ? `<button class="${e.kind === 'add' && e.n > 0 ? 'mint' : 'coral'}" data-a="wapply" style="font-size:1.1rem">Apply to ${esc(p ? p.name : '')}: ${e.kind === 'bankrupt' ? 'back to $0' : (e.n > 0 ? '+' : '−') + money(Math.abs(e.n)).replace('-', '')}</button>` : ''}
-      ${w.applied ? `<span class="stakes">Applied ✓</span>` : ''}<button class="gold" data-a="wdone">Done <span class="kbd">Enter</span></button></div>`; }
+  else { const line = items[w.idx] || '', label = wheelLabel(line), e = wheelParse(line), nm = esc(p ? p.name : '');
+    let act = '', sub = '';
+    if (e && !w.applied) {
+      if (e.kind === 'done') { sub = `Worth ${money(e.n)} if ${nm} does it.`; act = `<button class="mint" data-a="wapply" data-ok="1" style="font-size:1.1rem">✓ Did it: +${money(e.n)}</button><button class="ghost" data-a="wapply" data-ok="0">Passed (no points)</button>`; }
+      else if (e.kind === 'split') { sub = e.guess ? `${nm} acts it out. The first person to guess it splits ${money(e.n)} with ${nm}. Who guessed it?` : `${nm} picks a partner. Say the same word within 6 tries to split ${money(e.n)}.`;
+        act = `<div style="width:100%"><div class="pickrow">${G.players.filter(q => q.id !== w.pid).map(q => `<button class="small ${q.id === w.partner ? 'sel' : ''}" data-a="wpartner" data-id="${q.id}">${esc(q.name)}</button>`).join('')}</div></div>
+          <button class="mint" data-a="wapply" data-ok="1" style="font-size:1.1rem" ${w.partner ? '' : 'disabled'}>✓ ${e.guess ? 'Guessed it' : 'Matched'}: +${money(Math.round(e.n / 2))} each</button><button class="ghost" data-a="wapply" data-ok="0">${e.guess ? 'Nobody got it' : 'No match'}</button>`; }
+      else act = `<button class="${(e.kind === 'add' && e.n > 0) || e.kind === 'double' ? 'mint' : 'coral'}" data-a="wapply" style="font-size:1.1rem">Apply to ${nm}: ${e.kind === 'bankrupt' ? 'back to $0' : e.kind === 'double' ? (p && p.score > 0 ? money(p.score) + ' → ' + money(p.score * 2) : 'nothing to double') : (e.n > 0 ? '+' : '−') + money(Math.abs(e.n)).replace('-', '')}</button>`;
+    }
+    side = `<div class="wheelres">${esc(label)}</div>${sub ? `<div class="stakes">${sub}</div>` : ''}
+    <div class="row" style="justify-content:center">${act}
+      ${w.applied ? `<span class="stakes">${w.applied === 'no' ? 'No points' : 'Applied ✓'}</span>` : ''}<button class="gold" data-a="wdone">Done <span class="kbd">Enter</span></button></div>`; }
   return `<div class="cluescreen" style="background:radial-gradient(circle at 50% 40%,#2c3fd6,var(--night))"><div class="center" style="gap:.8rem">
     <div style="font-family:var(--display);color:var(--gold);font-size:clamp(1.4rem,3vw,2.2rem);letter-spacing:.03em">SPIN THE WHEEL${p ? ' · ' + esc(p.name).toUpperCase() : ''}</div>
     <div class="wheelwrap"><div class="pointer"></div>${wheelSVG(items)}</div>${side}</div></div>`;
@@ -1046,7 +1150,6 @@ function modalHTML() {
   if (modal.type === 'menu') {
     const inPlay = ['board', 'clue', 'dd', 'roundEnd'].includes(G.phase);
     return `<div class="modal" data-a="closemodal"><div class="card" data-stop><h2>Menu</h2><div style="display:flex;flex-direction:column;gap:.5rem">
-      ${['board', 'roundEnd'].includes(G.phase) ? `<button data-a="wheelopen">🎡 Spin the wheel</button>` : ''}
       ${inPlay ? `<button data-a="m-endround">Skip to end of this round</button>` : ''}
       ${inPlay && finalReady() ? `<button data-a="m-final">Jump to Final Jeopardy</button>` : ''}
       <button data-a="m-lobby">Back to lobby (QR code)</button>
@@ -1081,6 +1184,7 @@ function render() {
   else if (ph === 'dd') body = viewDD();
   else if (ph === 'roundEnd') body = viewRoundEnd();
   else if (ph === 'duel') body = viewDuel();
+  else if (ph === 'wcard') body = viewWCard();
   else if (ph === 'wheel') body = viewWheel();
   else body = viewFinal();
   const showScores = !['setup', 'review', 'lobby'].includes(ph);
@@ -1121,7 +1225,8 @@ function onClick(e) {
     case 'tosetup': G.phase = 'setup'; save(); render(); break;
     case 'toreview': G.phase = 'review'; commit(); break;
     case 'tolobby': if (G.final && !finalReady()) toast('Heads up: no Final Jeopardy question yet. The game will end after the last round.'); G.phase = 'lobby'; commit(); break;
-    case 'toggledd': { const cl = G.rounds[R].cats[C].clues[K]; cl.dd = !cl.dd; save(); render(); break; }
+    case 'toggledd': { const cl = G.rounds[R].cats[C].clues[K]; cl.dd = !cl.dd; if (cl.dd) cl.wheel = false; save(); render(); break; }
+    case 'togglewc': { const cl = G.rounds[R].cats[C].clues[K]; cl.wheel = !cl.wheel; if (cl.wheel) cl.dd = false; save(); render(); break; }
     case 'addplayer': { const i = $('[data-f="newplayer"]'); const n = i && i.value.trim(); if (n) { G.players.push({ id: 'p' + uid(), name: n, score: 0, extra: true }); commit(); } break; }
     case 'rmplayer': G.players = G.players.filter(p => p.id !== el.dataset.id); commit(); break;
     case 'start': startGame(); break;
@@ -1146,11 +1251,13 @@ function onClick(e) {
     case 'duelgo': startDuel(); break;
     case 'draw': drawChallenge(); break;
     case 'duelwin': duelWinner(el.dataset.id); break;
-    case 'ddwheel': openWheel(G.current.dd.pid, true); break;
-    case 'wheelopen': openWheel(G.control, false); break;
-    case 'wpick': G.wheel.pid = el.dataset.id; G.wheel.token = 'w' + uid(); commit(); break;
+    case 'wpick': G.wheel.pid = el.dataset.id; G.wheel.token = 'w' + uid(); if (G.wheel.partner === el.dataset.id) G.wheel.partner = null; commit(); break;
     case 'wspin': spinWheel(); break;
-    case 'wapply': wheelApply(); break;
+    case 'wapply': wheelApply(el.dataset.ok == null ? undefined : el.dataset.ok === '1'); break;
+    case 'wpartner': G.wheel.partner = el.dataset.id; commit(); break;
+    case 'wcpick': G.current.wc.pid = el.dataset.id; commit(); break;
+    case 'wctake': takeCardMoney(); break;
+    case 'wcspin': openWheel(G.current.wc.pid, true); break;
     case 'wdone': wheelDone(); break;
     case 'finalclue': G.phase = 'finalClue'; commit(); break;
     case 'finalreveal': finalReveal(); break;
@@ -1184,6 +1291,7 @@ function onInput(e) {
   switch (f) {
     case 'title': G.title = t.value; save(); break;
     case 'ctitle': s.titles[i] = t.value; break;
+    case 'gtitle': s.titles[t.dataset.g] = t.value; break;
     case 'rtitle': G.rounds[R].cats[C].title = t.value; save(); break;
     case 'rtext': G.rounds[R].cats[C].clues[K].text = t.value; save(); break;
     case 'ftitle': G.final.cat = t.value; save(); break;
@@ -1201,10 +1309,12 @@ function onChange(e) {
   switch (f) {
     case 'file': { const file = t.files && t.files[0]; if (file) file.text().then(loadCSV); break; }
     case 'assign': s.assign[i] = t.value; render(); break;
-    case 'namecol': { s.nameCol = +t.value; s.qcols = s.headers.map((h, j) => j).filter(j => j !== s.nameCol && !/^timestamp$|email address|^email$|score/i.test(s.headers[j])); s.qcols.forEach(j => { if (!s.assign[j]) s.assign[j] = 'skip'; if (!s.titles[j]) s.titles[j] = shortTitle(s.headers[j]); }); render(); break; }
+    case 'gassign': s.assign[t.dataset.g] = t.value; render(); break;
+    case 'namecol': { s.nameCol = +t.value; const pset = new Set((s.groups || []).flatMap(g => g.cols)); s.qcols = s.headers.map((h, j) => j).filter(j => j !== s.nameCol && !pset.has(j) && !/^timestamp$|email address|^email$|score/i.test(s.headers[j])); s.qcols.forEach(j => { if (!s.assign[j]) s.assign[j] = 'skip'; if (!s.titles[j]) s.titles[j] = shortTitle(s.headers[j]); }); render(); break; }
     case 'percat': G.settings.perCat = +t.value; break;
     case 'rounds': cfg().rounds = +t.value; render(); break;
     case 'maxduels': cfg().maxDuels = +t.value; save(); break;
+    case 'wheelcards': cfg().wheelCards = +t.value; save(); break;
     case 'dd': G.settings.dailyDoubles = t.checked; break;
     case 'lock': G.settings.lockSubject = t.checked; break;
     case 'phoneclue': G.settings.showClueOnPhone = t.checked; break;
